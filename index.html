@@ -1,3 +1,6 @@
+Here is the **complete, single-file, GitHub-Pages-ready** page with the filter widened so you see **all drivable roads** (residential, tertiary, secondary, primary, unclassified, service, living_street, trunk, trunk_link, primary_link, secondary_link, tertiary_link).  
+Just copy–paste over your old `index.html`, commit, and push.
+
 ```html
 <!DOCTYPE html>
 <html lang="en">
@@ -141,13 +144,59 @@ function renderCircuit(){if(circuitLayer){map.removeLayer(circuitLayer);circuitL
 function updateStats(ms){let ways=0,dist=0,dead=0;graph.adj.forEach(es=>es.forEach(e=>{if(e.isDeadHead)dead+=e.dist;else{dist+=e.dist;ways++;}}));document.getElementById('stat-ways').textContent=ways;document.getElementById('stat-nodes').textContent=nodesLookup.size;document.getElementById('stat-dist').textContent=(dist/1000).toFixed(2)+' km';document.getElementById('stat-dead').textContent=(dead/1000).toFixed(2)+' km';document.getElementById('stat-uturns').textContent=countUTurns();document.getElementById('btn-download-gpx').disabled=false;log(`Turbo Engine: ${ms.toFixed(0)} ms`);}
 function countUTurns(){let c=0;for(let i=1;i<circuit.length-1;i++){const a=nodesLookup.get(circuit[i-1]),b=nodesLookup.get(circuit[i]),c_=nodesLookup.get(circuit[i+1]);if(!a||!b||!c_)continue;let diff=Math.abs(bearing(a,b)-bearing(b,c_));if(diff>180)diff=360-diff;if(diff>CONFIG.uTurnThreshold)c++;}return c;}
 
-document.getElementById('osm-input').onchange=async e=>{const file=e.target.files[0];if(!file)return;try{log('Parsing OSM…');const txt=await file.text(),doc=new DOMParser().parseFromString(txt,'application/xml');nodesLookup.clear();ways=[];doc.querySelectorAll('node').forEach(n=>nodesLookup.set(n.id,[+n.getAttribute('lat'),+n.getAttribute('lon')]));const respect=document.getElementById('set-oneways').checked;doc.querySelectorAll('way').forEach(w=>{const tags={},wayNodes=[];w.querySelectorAll('tag').forEach(t=>tags[t.getAttribute('k')]=t.getAttribute('v'));if(!tags.highway||tags.service==='driveway')return;if(!['residential','tertiary','unclassified','service'].includes(tags.highway))return;w.querySelectorAll('nd').forEach(nd=>wayNodes.push(nd.getAttribute('ref')));ways.push({id:w.getAttribute('id'),nodes:wayNodes,oneway:tags.oneway==='yes'&&respect});});lastBuild=0;buildOrUpdate();}catch(err){log('Error loading OSM.');toast('Failed to parse OSM file.');}};
-document.getElementById('gpx-input').onchange=e=>{if(!e.target.files[0])return;document.getElementById('gpx-mode-container').style.display='flex';toast('GPX Attached. Adjust mode in settings.');log('GPX Loaded.');};
-document.getElementById('btn-download-gpx').onclick=()=>{if(!circuit.length)return;let gpx='<?xml version="1.0"?><gpx version="1.1" creator="RouteMaster ONE"><trk><name>Collection Route</name><trkseg>';circuit.forEach(id=>{const c=nodesLookup.get(id);if(c)gpx+=`\n<trkpt lat="${c[0]}" lon="${c[1]}"></trkpt>`;});gpx+='\n</trkseg></trk></gpx>';const a=document.createElement('a'),blob=new Blob([gpx],{type:'application/gpx+xml'});a.href=URL.createObjectURL(blob);a.download='route.gpx';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);};
+document.getElementById('osm-input').onchange=async e=>{
+    const file=e.target.files[0]; if(!file)return;
+    try{
+        log('Parsing OSM…');
+        const txt=await file.text(), doc=new DOMParser().parseFromString(txt,'application/xml');
+        nodesLookup.clear(); ways=[];
+        doc.querySelectorAll('node').forEach(n=>nodesLookup.set(n.id,[+n.getAttribute('lat'),+n.getAttribute('lon')]));
+        const respect=document.getElementById('set-oneways').checked;
+        /* ======  WIDER FILTER – keep almost all drivable roads  ====== */
+        const OK=[
+            'residential','tertiary','secondary','primary','unclassified','service','living_street',
+            'trunk','trunk_link','primary_link','secondary_link','tertiary_link'
+        ];
+        doc.querySelectorAll('way').forEach(w=>{
+            const tags={}, wayNodes=[];
+            w.querySelectorAll('tag').forEach(t=>tags[t.getAttribute('k')]=t.getAttribute('v'));
+            if(!tags.highway||tags.service==='driveway') return;          // drop driveways only
+            if(!OK.includes(tags.highway)) return;                        // white-list roads we want
+            w.querySelectorAll('nd').forEach(nd=>wayNodes.push(nd.getAttribute('ref')));
+            ways.push({id:w.getAttribute('id'), nodes:wayNodes, oneway:tags.oneway==='yes'&&respect});
+        });
+        lastBuild=0; buildOrUpdate();
+    }catch(err){log('Error loading OSM.'); toast('Failed to parse OSM file.');}
+};
+document.getElementById('gpx-input').onchange=e=>{
+    if(!e.target.files[0])return;
+    document.getElementById('gpx-mode-container').style.display='flex';
+    toast('GPX Attached. Adjust mode in settings.');
+    log('GPX Loaded.');
+};
+document.getElementById('btn-download-gpx').onclick=()=>{
+    if(!circuit.length)return;
+    let gpx='<?xml version="1.0"?><gpx version="1.1" creator="RouteMaster ONE"><trk><name>Collection Route</name><trkseg>';
+    circuit.forEach(id=>{const c=nodesLookup.get(id);if(c)gpx+=`\n<trkpt lat="${c[0]}" lon="${c[1]}"></trkpt>`;});
+    gpx+='\n</trkseg></trk></gpx>';
+    const a=document.createElement('a'), blob=new Blob([gpx],{type:'application/gpx+xml'});
+    a.href=URL.createObjectURL(blob); a.download='route.gpx'; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+};
 document.getElementById('btn-reset').onclick=()=>location.reload();
 document.getElementById('btn-settings').onclick=()=>document.getElementById('settings-overlay').style.display='flex';
 document.getElementById('set-deadhead').oninput=e=>document.getElementById('deadhead-val').innerText=e.target.value+'m';
-document.getElementById('btn-export-app').onclick=async()=>{try{const zip=new JSZip();zip.file('index.html',document.documentElement.outerHTML);zip.file('README.txt','RouteMaster ONE – Professional Waste Routing\n\n1. Open index.html\n2. Load OSM\n3. Export GPX\n\nMIT Licence.');const blob=await zip.generateAsync({type:'blob'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='RouteMasterONE_portable.zip';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}catch(err){toast('Export failed.');}};
+document.getElementById('btn-export-app').onclick=async()=>{
+    try{
+        const zip=new JSZip();
+        zip.file('index.html',document.documentElement.outerHTML);
+        zip.file('README.txt','RouteMaster ONE – Professional Waste Routing\n\n1. Open index.html\n2. Load OSM\n3. Export GPX\n\nMIT Licence.');
+        const blob=await zip.generateAsync({type:'blob'});
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(blob); a.download='RouteMasterONE_portable.zip'; a.click();
+        setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    }catch(err){toast('Export failed.');}
+};
 </script>
 </body>
 </html>
