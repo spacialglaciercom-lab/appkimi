@@ -1,0 +1,324 @@
+/********************************************************************
+ *  RouteMaster ONE  –  optimised core  (drop-in replacement)
+ *  Author : your-name
+ *  Licence: MIT  (same as original file)
+ *******************************************************************/
+'use strict';
+/*  ========  CONFIG  ========  */
+const CONFIG = {
+    accent          : '#0078ff',
+    deadHeadColor   : '#a855f7',
+    wayColor        : '#64748b',
+    circuitColor    : '#0078ff',
+    maxDijkstraDist : 500,        // m  –  limit balancing search
+    uTurnThreshold  : 135         // °  –  what we count as U-turn
+};
+
+/*  ========  GLOBAL STATE  ========  */
+let map, graph, circuit = [], circuitLayer = null;
+let nodesLookup = new Map();      // id -> [lat,lon]
+let ways      = [];               // raw OSM ways
+let startId   = null;             // first node we see (used as root)
+let lastBuild = 0;                // timestamp of last full build
+
+/*  ========  LEAFLET INIT  ========  */
+window.addEventListener('DOMContentLoaded', ()=>{
+    delete L.Icon.Default.prototype._getIconUrl;
+    L.Icon.Default.mergeOptions({
+        iconRetinaUrl : 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+        iconUrl       : 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+        shadowUrl     : 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png'
+    });
+    map = L.map('map').setView([0,0],2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+        attribution:'© OpenStreetMap'
+    }).addTo(map);
+    log('Turbo Engine Ready.');
+});
+
+/*  ========  UTILS  ========  */
+const consoleEl = document.getElementById('console-footer');
+function log(msg){ consoleEl.innerText=msg; }
+function toast(msg){
+    const t=document.getElementById('toast');
+    t.innerText=msg; t.style.display='block';
+    setTimeout(()=>t.style.display='none',4000);
+}
+function haversine(a,b){          // a,b = [lat,lon]
+    const R=6371e3, toRad=Math.PI/180,
+          φ1=a[0]*toRad, φ2=b[0]*toRad, Δφ=(b[0]-a[0])*toRad, Δλ=(b[1]-a[1])*toRad,
+          x=Math.sin(Δφ/2), y=Math.sin(Δλ/2),
+          aa=x*x+Math.cos(φ1)*Math.cos(φ2)*y*y;
+    return 2*R*Math.atan2(Math.sqrt(aa),Math.sqrt(1-aa));
+}
+function bearing(a,b){
+    const toRad=Math.PI/180, toDeg=180/Math.PI,
+          φ1=a[0]*toRad, φ2=b[0]*toRad, λ1=a[1]*toRad, λ2=b[1]*toRad,
+          y=Math.sin(λ2-λ1)*Math.cos(φ2),
+          x=Math.cos(φ1)*Math.sin(φ2)-Math.sin(φ1)*Math.cos(φ2)*Math.cos(λ2-λ1);
+    return Math.atan2(y,x)*toDeg;
+}
+
+/*  ========  FAST GRAPH  ========  */
+class FastGraph{
+    constructor(){
+        this.adj  = new Map();     // u -> [ {to:v, dist, wayId, used:false}, … ]
+        this.degI = new Uint32Array(1<<20);  // big enough for towns
+        this.degO = new Uint32Array(1<<20);
+        this.idx  = new Map();     // original id -> compact 0-based
+        this.rev  = [];            // compact -> original
+        this.edgeCnt=0;
+    }
+    addEdge(u,v,d,wayId,isDH=false){
+        if(!this.idx.has(u)){ this.idx.set(u,this.rev.length); this.rev.push(u); }
+        if(!this.idx.has(v)){ this.idx.set(v,this.rev.length); this.rev.push(v); }
+        const ui=this.idx.get(u), vi=this.idx.get(v);
+        if(!this.adj.has(ui))this.adj.set(ui,[]);
+        this.adj.get(ui).push({to:vi,dist:d,wayId,isDeadHead:isDH,used:false});
+        this.degO[ui]++; this.degI[vi]++; this.edgeCnt++;
+    }
+    compactDegrees(){
+        this.degI.fill(0); this.degO.fill(0); this.edgeCnt=0;
+        this.adj.forEach((arr,u)=>{
+            this.degO[u]=arr.length;
+            arr.forEach(e=>{ this.degI[e.to]++; this.edgeCnt++; });
+        });
+    }
+    /*  returns {sources:[],sinks:[]}  (compact indices)  */
+    getUnbalanced(){
+        const src=[],snk=[];
+        for(let i=0;i<this.rev.length;i++){
+            const d=this.degO[i]-this.degI[i];
+            if(d>0) for(let k=0;k<d;k++) snk.push(i);
+            if(d<0) for(let k=0;k<-d;k++) src.push(i);
+        }
+        return {sources:src,sinks:snk};
+    }
+}
+
+/*  ========  INCREMENTAL ENGINE  ========  */
+function needsFullRebuild(){
+    // only full rebuild if new OSM file
+    return performance.now()-lastBuild > 60*60*1000; // 1 h – or detect new file
+}
+function buildOrUpdate(){
+    const t0=performance.now();
+    const respect=document.getElementById('set-oneways').checked;
+    const minUTurn=document.getElementById('set-uturns').checked;
+    const maxDead=+document.getElementById('set-deadhead').value;
+
+    if(!graph || needsFullRebuild()){
+        graph=new FastGraph();
+        ways.forEach(w=>{
+            for(let i=0;i<w.nodes.length-1;i++){
+                const u=w.nodes[i], v=w.nodes[i+1];
+                const cu=nodesLookup.get(u), cv=nodesLookup.get(v);
+                if(!cu||!cv) continue;
+                const d=haversine(cu,cv);
+                graph.addEdge(u,v,d,w.id);
+                if(!w.oneway) graph.addEdge(v,u,d,w.id);
+            }
+        });
+        lastBuild=performance.now();
+        startId=graph.rev[0];
+    }
+    balanceGraph(maxDead,minUTurn);
+    findEulerianCircuit();
+    updateStats(performance.now()-t0);
+}
+
+/*  ========  BALANCING WITH SHORTEST PATHS  ========  */
+function balanceGraph(maxDead,minUTurn){
+    graph.compactDegrees();
+    let {sources,sinks}=graph.getUnbalanced();
+    if(!sources.length) return;
+
+    /*  build forward adj for Dijkstra (only inside sinks neighbourhood)  */
+    const fwd=new Map();
+    graph.adj.forEach((arr,u)=>{
+        arr.forEach(e=>{
+            if(!fwd.has(u))fwd.set(u,[]);
+            fwd.get(u).push([e.to,e.dist]);
+        });
+    });
+
+    /*  priority queue (binary heap)  */
+    class PQ{
+        constructor(){this.h=[];}
+        push(k,v){this.h.push([k,v]); this.h.sort((a,b)=>a[0]-b[0]);}
+        pop(){return this.h.shift();}
+        get len(){return this.h.length;}
+    }
+
+    /*  single-source shortest paths from each source  */
+    const deadEdges=[];
+    const used=new Uint8Array(graph.rev.length);
+    sources.sort(()=>Math.random()-.5);   // randomise to break symmetry
+    for(const s of sources){
+        const dist=new Float32Array(graph.rev.length).fill(Infinity);
+        const prev=new Int32Array(graph.rev.length).fill(-1);
+        const pq=new PQ(); pq.push(0,s); dist[s]=0;
+        while(pq.len){
+            const [d,u]=pq.pop();
+            if(d>dist[u]) continue;
+            if(used[u] && sinks.includes(u)) break; // target already used
+            const edges=fwd.get(u);
+            if(!edges) continue;
+            for(const [v,c] of edges){
+                const nd=d+c;
+                if(nd<dist[v]){ dist[v]=nd; prev[v]=u; pq.push(nd,v); }
+            }
+        }
+        /*  pick closest unused sink  */
+        let bestSink=-1, bestD=Infinity, bestHeading=0;
+        for(const t of sinks){
+            if(used[t]) continue;
+            const d=dist[t];
+            if(d>maxDead || d>bestD) continue;
+            /*  heading-based tie breaker  */
+            let headingScore=1;
+            if(minUTurn){
+                const pS=nodesLookup.get(graph.rev[s]), pT=nodesLookup.get(graph.rev[t]);
+                const h0=bearing(pS,pT);
+                const arr=graph.adj.get(prev[t]);
+                if(arr&&arr.length){
+                    const e=arr.find(x=>x.to===t);
+                    if(e){
+                        const pP=nodesLookup.get(graph.rev[prev[t]]);
+                        const h1=bearing(pP,pT);
+                        let diff=Math.abs(h0-h1); if(diff>180)diff=360-diff;
+                        headingScore=diff;               // bigger is better
+                    }
+                }
+            }
+            if(d<bestD || (d===bestD && headingScore>bestHeading)){
+                bestD=d; bestSink=t; bestHeading=headingScore;
+            }
+        }
+        if(bestSink===-1) continue;
+
+        /*  add dead-head edge  */
+        graph.addEdge(graph.rev[s],graph.rev[bestSink],bestD,'deadhead',true);
+        used[bestSink]=1;
+    }
+}
+
+/*  ========  HIERHOLZER EULERIAN CIRCUIT  ========  */
+function findEulerianCircuit(){
+    if(!graph||graph.edgeCnt===0) return;
+    const adj=graph.adj;
+    const circuitStack=[], path=[];
+    let curr=graph.idx.get(startId)||0;
+    circuitStack.push(curr);
+
+    /*  fast unused-edge lookup  */
+    const nextEdge=u=>{
+        const es=adj.get(u);
+        if(!es) return null;
+        for(let i=0;i<es.length;i++){
+            if(!es[i].used){ es[i].used=true; return es[i]; }
+        }
+        return null;
+    };
+
+    while(circuitStack.length){
+        const e=nextEdge(curr);
+        if(e){
+            circuitStack.push(curr=e.to);
+        }else{
+            path.push(curr);
+            curr=circuitStack.pop();
+        }
+    }
+    path.reverse();
+    circuit=path.map(i=>graph.rev[i]);  // back to original OSM ids
+    renderCircuit();
+}
+
+/*  ========  RENDER  ========  */
+function renderCircuit(){
+    if(circuitLayer){ map.removeLayer(circuitLayer); circuitLayer=null; }
+    const latlngs=circuit.map(i=>nodesLookup.get(i)).filter(x=>x);
+    if(latlngs.length<2) return;
+    circuitLayer=L.polyline(latlngs,{color:CONFIG.circuitColor,weight:6,opacity:.8,interactive:false}).addTo(map);
+    map.fitBounds(circuitLayer.getBounds(),{padding:[20,20]});
+}
+
+/*  ========  STATS  ========  */
+function updateStats(ms){
+    let ways=0, dist=0, dead=0, uturns=0;
+    graph.adj.forEach(es=>es.forEach(e=>{
+        if(e.isDeadHead) dead+=e.dist; else{ dist+=e.dist; ways++; }
+    }));
+    document.getElementById('stat-ways').textContent=ways;
+    document.getElementById('stat-nodes').textContent=nodesLookup.size;
+    document.getElementById('stat-dist').textContent=(dist/1000).toFixed(2)+' km';
+    document.getElementById('stat-dead').textContent=(dead/1000).toFixed(2)+' km';
+    document.getElementById('stat-uturns').textContent=countUTurns();
+    document.getElementById('btn-download-gpx').disabled=false;
+    log(`Turbo Engine: ${ms.toFixed(0)} ms`);
+}
+function countUTurns(){
+    let c=0;
+    for(let i=1;i<circuit.length-1;i++){
+        const a=nodesLookup.get(circuit[i-1]), b=nodesLookup.get(circuit[i]), c_=nodesLookup.get(circuit[i+1]);
+        if(!a||!b||!c_) continue;
+        let diff=Math.abs(bearing(a,b)-bearing(b,c_));
+        if(diff>180) diff=360-diff;
+        if(diff>CONFIG.uTurnThreshold) c++;
+    }
+    return c;
+}
+
+/*  ========  FILE HANDLERS  ========  */
+document.getElementById('osm-input').onchange=async e=>{
+    const file=e.target.files[0]; if(!file) return;
+    try{
+        log('Parsing OSM…');
+        const txt=await file.text(), doc=new DOMParser().parseFromString(txt,'application/xml');
+        nodesLookup.clear(); ways=[];
+        doc.querySelectorAll('node').forEach(n=>
+            nodesLookup.set(n.id,[+n.getAttribute('lat'),+n.getAttribute('lon')]));
+        const respect=document.getElementById('set-oneways').checked;
+        doc.querySelectorAll('way').forEach(w=>{
+            const tags={}, wayNodes=[];
+            w.querySelectorAll('tag').forEach(t=>tags[t.getAttribute('k')]=t.getAttribute('v'));
+            if(!tags.highway||tags.service==='driveway') return;
+            if(!['residential','tertiary','unclassified','service'].includes(tags.highway)) return;
+            w.querySelectorAll('nd').forEach(nd=>wayNodes.push(nd.getAttribute('ref')));
+            ways.push({id:w.getAttribute('id'), nodes:wayNodes, oneway:tags.oneway==='yes'&&respect});
+        });
+        lastBuild=0; buildOrUpdate();
+    }catch(err){ log('Error loading OSM.'); toast('Failed to parse OSM file.'); }
+};
+document.getElementById('gpx-input').onchange=e=>{
+    if(!e.target.files[0]) return;
+    document.getElementById('gpx-mode-container').style.display='flex';
+    toast('GPX Attached. Adjust mode in settings.');
+    log('GPX Loaded.');
+};
+
+/*  ========  UI BINDINGS  (unchanged)  ========  */
+document.getElementById('btn-download-gpx').onclick=()=>{
+    if(!circuit.length) return;
+    let gpx=`<?xml version="1.0"?><gpx version="1.1" creator="RouteMaster ONE"><trk><name>Collection Route</name><trkseg>`;
+    circuit.forEach(id=>{const c=nodesLookup.get(id); if(c) gpx+=`\n<trkpt lat="${c[0]}" lon="${c[1]}"></trkpt>`;});
+    gpx+=`\n</trkseg></trk></gpx>`;
+    const a=document.createElement('a'), blob=new Blob([gpx],{type:'application/gpx+xml'});
+    a.href=URL.createObjectURL(blob); a.download='route.gpx'; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+};
+document.getElementById('btn-reset').onclick=()=>location.reload();
+document.getElementById('btn-settings').onclick=()=>document.getElementById('settings-overlay').style.display='flex';
+document.getElementById('set-deadhead').oninput=e=>document.getElementById('deadhead-val').innerText=e.target.value+'m';
+document.getElementById('btn-export-app').onclick=async()=>{
+    try{
+        const zip=new JSZip();
+        zip.file('index.html',document.documentElement.outerHTML);
+        zip.file('README.txt','RouteMaster ONE – Professional Waste Routing\n\n1. Open index.html\n2. Load OSM\n3. Export GPX\n\nMIT Licence.');
+        const blob=await zip.generateAsync({type:'blob'});
+        const a=document.createElement('a');
+        a.href=URL.createObjectURL(blob); a.download='RouteMasterONE_portable.zip'; a.click();
+        setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    }catch(err){ toast('Export failed.'); }
+};
