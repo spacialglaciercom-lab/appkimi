@@ -1,8 +1,4 @@
-/********************************************************************
- *  RouteMaster ONE  –  optimised core  (drop-in replacement)
- *  Author : your-name
- *  Licence: MIT  (same as original file)
- *******************************************************************/
+
 'use strict';
 /*  ========  CONFIG  ========  */
 const CONFIG = {
@@ -321,4 +317,5 @@ document.getElementById('btn-export-app').onclick=async()=>{
         a.href=URL.createObjectURL(blob); a.download='RouteMasterONE_portable.zip'; a.click();
         setTimeout(()=>URL.revokeObjectURL(a.href),1000);
     }catch(err){ toast('Export failed.'); }
+
 };
